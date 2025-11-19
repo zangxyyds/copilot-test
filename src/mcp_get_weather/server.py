@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+import time
 from collections.abc import AsyncIterator
 
 import anyio
@@ -19,31 +20,62 @@ from starlette.types import Receive, Scope, Send
 OPENWEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
 DEFAULT_UNITS = "metric"  # use Celsius by default
 DEFAULT_LANG = "zh_cn"  # Chinese descriptions
+CACHE_TTL = 300  # Cache weather data for 5 minutes
 
 
-async def fetch_weather(city: str, api_key: str) -> dict[str, str]:
+# Simple in-memory cache for weather data
+class WeatherCache:
+    """Simple time-based cache for weather data."""
+
+    def __init__(self, ttl: int = CACHE_TTL):
+        self.ttl = ttl
+        self._cache: dict[str, tuple[dict, float]] = {}
+
+    def get(self, key: str) -> dict[str, str] | None:
+        """Get cached data if not expired."""
+        if key in self._cache:
+            data, timestamp = self._cache[key]
+            if time.time() - timestamp < self.ttl:
+                return data
+            # Remove expired entry
+            del self._cache[key]
+        return None
+
+    def set(self, key: str, value: dict[str, str]) -> None:
+        """Store data with current timestamp."""
+        self._cache[key] = (value, time.time())
+
+
+async def fetch_weather(city: str, api_key: str, client: httpx.AsyncClient, cache: WeatherCache) -> dict[str, str]:
     """Call OpenWeather API and return a simplified weather dict.
+
+    Uses provided client for connection reuse and cache to reduce API calls.
 
     Raises:
         httpx.HTTPStatusError: if the response has a non-2xx status.
     """
+    # Check cache first
+    cache_key = city.lower()
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        return cached_data
+
     params = {
         "q": city,
         "appid": api_key,
         "units": DEFAULT_UNITS,
         "lang": DEFAULT_LANG,
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(OPENWEATHER_URL, params=params)
-        r.raise_for_status()
-        data = r.json()
+    r = await client.get(OPENWEATHER_URL, params=params)
+    r.raise_for_status()
+    data = r.json()
     # Extract a concise summary
     weather_main = data["weather"][0]["main"]
     description = data["weather"][0]["description"]
     temp = data["main"]["temp"]
     feels_like = data["main"]["feels_like"]
     humidity = data["main"]["humidity"]
-    return {
+    result = {
         "city": city,
         "weather": weather_main,
         "description": description,
@@ -51,6 +83,9 @@ async def fetch_weather(city: str, api_key: str) -> dict[str, str]:
         "feels_like": f"{feels_like}°C",
         "humidity": f"{humidity}%",
     }
+    # Store in cache
+    cache.set(cache_key, result)
+    return result
 
 
 @click.command()
@@ -77,7 +112,7 @@ def main(port: int, api_key: str, log_level: str, json_response: bool) -> int:
 
     # ---------------------- Configure logging ----------------------
     logging.basicConfig(
-        level=getattr(logging, loglevel.upper()),
+        level=getattr(logging, log_level.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logger = logging.getLogger("weather-server")
@@ -85,10 +120,16 @@ def main(port: int, api_key: str, log_level: str, json_response: bool) -> int:
     # ---------------------- Create MCP Server ----------------------
     app = Server("mcp-streamable-http-weather")
 
+    # ---------------------- Shared resources ----------------------
+    # Create shared httpx client and cache for efficient resource use
+    http_client: httpx.AsyncClient | None = None
+    weather_cache = WeatherCache()
+
     # ---------------------- Tool implementation -------------------
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         """Handle the 'get-weather' tool call."""
+        nonlocal http_client
         ctx = app.request_context
         city = arguments.get("location")
         if not city:
@@ -103,7 +144,7 @@ def main(port: int, api_key: str, log_level: str, json_response: bool) -> int:
         )
 
         try:
-            weather = await fetch_weather(city, api_key)
+            weather = await fetch_weather(city, api_key, http_client, weather_cache)
         except Exception as err:
             # Stream the error to the client and re-raise so MCP returns error.
             await ctx.session.send_log_message(
@@ -167,12 +208,17 @@ def main(port: int, api_key: str, log_level: str, json_response: bool) -> int:
     # ---------------------- Lifespan Management --------------------
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        nonlocal http_client
+        # Initialize shared HTTP client
+        http_client = httpx.AsyncClient(timeout=10)
         async with session_manager.run():
             logger.info("Weather MCP server started! 🚀")
             try:
                 yield
             finally:
                 logger.info("Weather MCP server shutting down…")
+                # Clean up HTTP client
+                await http_client.aclose()
 
     # ---------------------- ASGI app + Uvicorn ---------------------
     starlette_app = Starlette(
